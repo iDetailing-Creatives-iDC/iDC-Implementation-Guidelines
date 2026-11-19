@@ -1,0 +1,104 @@
+name: Copy to Dropbox
+
+# Uploads a ZIP of the default branch to Dropbox after every change to it,
+# so people who don't use GitHub always find the current code there.
+# GitHub stays the only place where the code is edited.
+# Same file in every repo: only DROPBOX_FOLDER changes.
+
+on:
+  push:
+  # Commits pushed by these workflows (auto-merges, build/docs commits) don't fire
+  # a push event, so run after them too. Names not present in a repo are ignored.
+  workflow_run:
+    workflows: ["Dependabot Auto Merge", "build-kona", "Docs CI"]
+    types: [completed]
+  workflow_dispatch:
+
+env:
+  # Dropbox folder that receives the ZIP, as seen from the top of "iDC Dropbox".
+  DROPBOX_FOLDER: "/iDC Projects/iDC/Kona/Implementation guide/4_GitHub/Implementation-Guidelines"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dropbox-copy
+  cancel-in-progress: false
+
+jobs:
+  copy:
+    # Only the default branch is copied
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Build the ZIP
+        env:
+          BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          REPO="${GITHUB_REPOSITORY#*/}"
+          ZIP="$RUNNER_TEMP/$REPO-$BRANCH-latest.zip"
+          INFO="$RUNNER_TEMP/_GITHUB-COPY-INFO.txt"
+          {
+            echo "This ZIP is an automatic copy of the code on GitHub. Don't edit it here: changes are overwritten."
+            echo
+            echo "Repository: https://github.com/$GITHUB_REPOSITORY"
+            echo "Branch:     $BRANCH"
+            echo "Commit:     $(git log -1 --format='%h  %s')"
+            echo "Committed:  $(TZ=UTC git log -1 --format='%cd' --date=format-local:'%Y-%m-%d %H:%M UTC')"
+          } > "$INFO"
+          git archive --format=zip --prefix="$REPO/" --add-file="$INFO" -o "$ZIP" HEAD
+          ls -l "$ZIP"
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+          echo "ZIP_NAME=$(basename "$ZIP")" >> "$GITHUB_ENV"
+
+      - name: Upload to Dropbox
+        env:
+          DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+          DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+          DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DROPBOX_APP_KEY" ] || [ -z "$DROPBOX_APP_SECRET" ] || [ -z "$DROPBOX_REFRESH_TOKEN" ]; then
+            echo "::error::Missing secrets: DROPBOX_APP_KEY, DROPBOX_APP_SECRET, DROPBOX_REFRESH_TOKEN (org secrets must be shared with this repo)"; exit 1
+          fi
+
+          # 1. Short-lived access token from the long-lived refresh token
+          TOKEN=$(curl -sS --fail-with-body https://api.dropbox.com/oauth2/token \
+            -u "$DROPBOX_APP_KEY:$DROPBOX_APP_SECRET" \
+            -d grant_type=refresh_token -d "refresh_token=$DROPBOX_REFRESH_TOKEN" | jq -r .access_token)
+          echo "::add-mask::$TOKEN"
+
+          # 2. Root of the team space, so paths start at the top of "iDC Dropbox"
+          ROOT=$(curl -sS --fail-with-body -X POST https://api.dropboxapi.com/2/users/get_current_account \
+            -H "Authorization: Bearer $TOKEN" | jq -r .root_info.root_namespace_id)
+          PATH_ROOT=$(jq -cn --arg r "$ROOT" '{".tag":"root","root":$r}')
+          COMMIT=$(jq -cn --ascii-output --arg p "$DROPBOX_FOLDER/$ZIP_NAME" '{path:$p,mode:"overwrite",mute:true}')
+          dbx() {  # dbx <endpoint> <Dropbox-API-Arg> <file>
+            curl -sS --fail-with-body -X POST "https://content.dropboxapi.com/2/files/$1" \
+              -H "Authorization: Bearer $TOKEN" -H "Dropbox-API-Path-Root: $PATH_ROOT" \
+              -H "Dropbox-API-Arg: $2" -H "Content-Type: application/octet-stream" --data-binary @"$3"
+          }
+
+          # 3. Upload, replacing the previous copy (in 100 MB parts above 140 MB)
+          SIZE=$(stat -c %s "$ZIP")
+          if [ "$SIZE" -le 140000000 ]; then
+            dbx upload "$COMMIT" "$ZIP" | jq '{path_display, size, server_modified}'
+          else
+            split -b 100000000 -d "$ZIP" "$RUNNER_TEMP/part_"
+            OFFSET=0; SESSION=""
+            for PART in "$RUNNER_TEMP"/part_*; do
+              if [ -z "$SESSION" ]; then
+                SESSION=$(dbx upload_session/start '{"close":false}' "$PART" | jq -r .session_id)
+              else
+                dbx upload_session/append_v2 "$(jq -cn --arg s "$SESSION" --argjson o "$OFFSET" '{cursor:{session_id:$s,offset:$o},close:false}')" "$PART" > /dev/null
+              fi
+              OFFSET=$((OFFSET + $(stat -c %s "$PART")))
+            done
+            : > "$RUNNER_TEMP/empty"
+            dbx upload_session/finish "$(jq -cn --arg s "$SESSION" --argjson o "$OFFSET" --argjson c "$COMMIT" '{cursor:{session_id:$s,offset:$o},commit:$c}')" "$RUNNER_TEMP/empty" \
+              | jq '{path_display, size, server_modified}'
+          fi
