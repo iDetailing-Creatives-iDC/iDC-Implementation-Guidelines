@@ -67,18 +67,18 @@ jobs:
           fi
 
           # 1. Short-lived access token from the long-lived refresh token
-          TOKEN=$(curl -sS --fail-with-body https://api.dropbox.com/oauth2/token \
+          TOKEN=$(curl -sS --fail-with-body --retry 8 https://api.dropbox.com/oauth2/token \
             -u "$DROPBOX_APP_KEY:$DROPBOX_APP_SECRET" \
             -d grant_type=refresh_token -d "refresh_token=$DROPBOX_REFRESH_TOKEN" | jq -r .access_token)
           echo "::add-mask::$TOKEN"
 
           # 2. Root of the team space, so paths start at the top of "iDC Dropbox"
-          ROOT=$(curl -sS --fail-with-body -X POST https://api.dropboxapi.com/2/users/get_current_account \
+          ROOT=$(curl -sS --fail-with-body --retry 8 -X POST https://api.dropboxapi.com/2/users/get_current_account \
             -H "Authorization: Bearer $TOKEN" | jq -r .root_info.root_namespace_id)
           PATH_ROOT=$(jq -cn --arg r "$ROOT" '{".tag":"root","root":$r}')
           COMMIT=$(jq -cn --ascii-output --arg p "$DROPBOX_FOLDER/$ZIP_NAME" '{path:$p,mode:"overwrite",mute:true}')
           dbx() {  # dbx <endpoint> <Dropbox-API-Arg> <file>
-            curl -sS --fail-with-body -X POST "https://content.dropboxapi.com/2/files/$1" \
+            curl -sS --fail-with-body --retry 8 -X POST "https://content.dropboxapi.com/2/files/$1" \
               -H "Authorization: Bearer $TOKEN" -H "Dropbox-API-Path-Root: $PATH_ROOT" \
               -H "Dropbox-API-Arg: $2" -H "Content-Type: application/octet-stream" --data-binary @"$3"
           }
